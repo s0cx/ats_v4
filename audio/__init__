@@ -1,0 +1,163 @@
+# audio/engine.py
+import numpy as np
+import threading
+import os
+from typing import Callable
+from scipy.io.wavfile import write as wav_write
+from core.utils import safe_norm, apply_adsr, freq_map
+
+try:
+    import soundfile as sf  # optional, preferred for streaming write
+    SOUND_FILE_AVAILABLE = True
+except Exception:
+    SOUND_FILE_AVAILABLE = False
+
+class AudioEngine:
+    """
+    Vectorized, chunked audio engine.
+    progress_callback(percent_float_0_100, status_str)
+    """
+
+    def __init__(self, progress_callback: Callable[[float, str], None] = None):
+        self.progress_callback = progress_callback or (lambda p, s: None)
+        self._stop_flag = threading.Event()
+
+    def stop(self):
+        self._stop_flag.set()
+
+    def reset_stop(self):
+        self._stop_flag.clear()
+
+    def _report(self, pct: float, msg: str):
+        try:
+            self.progress_callback(float(pct), str(msg))
+        except Exception:
+            pass
+
+    def generate_from_image(self, image_processor, out_path: str, preset) -> str:
+        """
+        Generate WAV: chunked generation. Returns path to file written.
+        """
+        self.reset_stop()
+        sr = int(preset.sample_rate)
+        self._report(2.0, "Preparing image...")
+        img = image_processor.transformed(rotation=preset.rotation,
+                                          flip_h=preset.flip_h,
+                                          flip_v=preset.flip_v,
+                                          invert=preset.invert,
+                                          brightness=preset.brightness,
+                                          contrast=preset.contrast)
+
+        # determine duration
+        if preset.duration <= 0:
+            duration = max(1, int(round(img.width / 160)))
+        else:
+            duration = int(preset.duration)
+        total_samples = int(sr * duration)
+        self._report(4.0, f"Duration: {duration}s ({total_samples} samples)")
+
+        height = int(preset.height)
+        freqs = freq_map(height, preset.min_freq, preset.max_freq, preset.freq_scale)
+        width_now = max(1, img.width)
+        x_src = np.linspace(0, width_now - 1, width_now)
+
+        if preset.rgb_mode:
+            r_arr, g_arr, b_arr = image_processor.to_rgb_arrays(img, height)
+        else:
+            img_arr = image_processor.to_grayscale_array(img, height)
+
+        chunk = int(min(preset.chunk_samples, total_samples))
+        channels = 2 if preset.stereo else 1
+
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+        use_soundfile = SOUND_FILE_AVAILABLE
+        if use_soundfile:
+            writer = sf.SoundFile(out_path, mode='w', samplerate=sr, channels=channels, subtype='PCM_16')
+        else:
+            blocks = []
+
+        rng = np.random.default_rng(12345 if not preset.phase_random else None)
+        ang_freqs = 2.0 * np.pi * freqs
+
+        samples_done = 0
+        while samples_done < total_samples:
+            if self._stop_flag.is_set():
+                self._report(0.0, "Cancelled")
+                if use_soundfile:
+                    writer.close()
+                raise InterruptedError("Generation cancelled")
+
+            this_chunk = min(chunk, total_samples - samples_done)
+            t0 = samples_done / sr
+            t = np.linspace(t0, t0 + (this_chunk / sr), this_chunk, endpoint=False, dtype=np.float32)
+
+            # x_target for interpolation for the chunk
+            x_target = np.linspace(0, width_now - 1, total_samples, dtype=np.float32)[samples_done:samples_done + this_chunk]
+
+            left_chunk = np.zeros(this_chunk, dtype=np.float32)
+            right_chunk = np.zeros(this_chunk, dtype=np.float32)
+
+            # iterate rows (height)
+            for y in range(height):
+                if preset.rgb_mode:
+                    row_r = np.interp(x_target, x_src, r_arr[y])
+                    row_g = np.interp(x_target, x_src, g_arr[y])
+                    row_b = np.interp(x_target, x_src, b_arr[y])
+                    phase = 0.0 if not preset.phase_random else float(rng.uniform(0, 2*np.pi))
+                    sig = np.sin(ang_freqs[y] * t + phase).astype(np.float32)
+                    if preset.rgb_to_stereo:
+                        left_chunk += (row_r * sig) + 0.5 * (row_g * sig)
+                        right_chunk += (row_b * sig) + 0.5 * (row_g * sig)
+                    else:
+                        mix = (row_r + row_g + row_b) / 3.0
+                        left_chunk += mix * sig
+                        right_chunk += mix * sig
+                else:
+                    row = np.interp(x_target, x_src, img_arr[y])
+                    phase = 0.0 if not preset.phase_random else float(rng.uniform(0, 2*np.pi))
+                    sig = np.sin(ang_freqs[y] * t + phase).astype(np.float32)
+                    left_chunk += row * sig
+                    right_chunk += row * sig
+
+                # light progress update
+                if (y % max(1, height // 6)) == 0:
+                    pct = 5.0 + ((samples_done + (y/height)*this_chunk) / total_samples) * 85.0
+                    self._report(pct, f"Synth rows {y+1}/{height}")
+
+            # apply normalization and ADSR, combine, write
+            if not preset.stereo:
+                mono = 0.5 * (left_chunk + right_chunk)
+                mono = safe_norm(mono)
+                mono = apply_adsr(mono, sr, preset.attack, preset.decay, preset.sustain, preset.release)
+                mono *= preset.volume
+                int_block = (np.clip(mono, -1.0, 1.0) * 32767.0).astype(np.int16)
+                if use_soundfile:
+                    writer.write(int_block)
+                else:
+                    blocks.append(int_block)
+            else:
+                l = safe_norm(left_chunk)
+                rch = safe_norm(right_chunk)
+                l = apply_adsr(l, sr, preset.attack, preset.decay, preset.sustain, preset.release) * preset.volume
+                rch = apply_adsr(rch, sr, preset.attack, preset.decay, preset.sustain, preset.release) * preset.volume
+                stereo_block = np.stack((l, rch), axis=1)
+                int_block = (np.clip(stereo_block, -1.0, 1.0) * 32767.0).astype(np.int16)
+                if use_soundfile:
+                    writer.write(int_block)
+                else:
+                    blocks.append(int_block)
+
+            samples_done += this_chunk
+            pct = 5.0 + (samples_done / total_samples) * 90.0
+            self._report(pct, f"Rendered {samples_done}/{total_samples}")
+
+        # finalize
+        if use_soundfile:
+            writer.close()
+        else:
+            data = np.concatenate(blocks, axis=0)
+            wav_write(out_path, sr, data)
+
+        self._report(100.0, f"Saved {os.path.basename(out_path)}")
+        return out_path

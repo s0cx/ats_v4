@@ -1,0 +1,11 @@
+customtkinter==5.2.2
+Pillow>=9.0.0
+numpy>=1.23
+scipy>=1.9
+matplotlib>=3.5
+soundfile>=0.11
+simpleaudio>=1.0.4
+# Optional but recommended (install manually with CUDA-specific package):
+# cupy (install the matching wheel for your CUDA version, e.g. pip install cupy-cuda11x)
+# Drag-and-drop optional:
+# tkinterdnd2

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.env/
+
+# macOS junk
+.DS_Store
+
+# Audio / cache
+*.wav
+*.aiff
+*.flac
+*.mp3
+
+# Build artifacts
+dist/
+build/
+
+*.dmg*.dmg
+dist/
+build/
+*.dmg
+dist/
+build/
